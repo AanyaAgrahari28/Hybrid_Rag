@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+chroma_db/
+*.pyc
+.streamlit/secrets.toml
+chroma_db_Vermaanant/
