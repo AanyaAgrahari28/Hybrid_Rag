@@ -33,8 +33,11 @@ def build_rag(pdf_path):
 
         except Exception:
             raise ValueError(
-                "This PDF is encrypted, corrupted, or unsupported."
+                "Unable to process this PDF. It may be protected, corrupted, or unsupported."
             )
+    if not documents:
+        raise ValueError("No text could be extracted from this PDF.")
+    
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=75)
     docs = text_splitter.split_documents(documents)
     print("Documents:", len(documents))

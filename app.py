@@ -30,8 +30,12 @@ if uploaded_file:
     ):
 
         with st.spinner("Processing PDF..."):
-            st.session_state.qa_chain = build_rag(pdf_path)
+            try:
+                st.session_state.qa_chain = build_rag(pdf_path)
 
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
         st.session_state.current_pdf = uploaded_file.name
         st.session_state.chat_history = []
 
