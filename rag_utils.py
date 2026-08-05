@@ -6,7 +6,10 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_ollama import ChatOllama
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    PyMuPDFLoader
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain_community.retrievers import BM25Retriever
@@ -18,25 +21,39 @@ from langchain_classic.chains import RetrievalQA
 def build_rag(pdf_path): 
     
     # Load documents and split into chunks
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
+    try:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+    except Exception:
+
+        try:
+            loader = PyMuPDFLoader(pdf_path)
+            documents = loader.load()
+
+        except Exception:
+            raise ValueError(
+                "This PDF is encrypted, corrupted, or unsupported."
+            )
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=75)
     docs = text_splitter.split_documents(documents)
-    print(len(docs))
+    print("Documents:", len(documents))
+    print("Chunks:", len(docs))
+
+    if len(docs) == 0:
+        raise ValueError("No text could be extracted from this PDF.")
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
         dimensions=768
     )
-    embeddings
-    vdb = Chroma(
-        persist_directory="./chroma_db_Vermaanant",
-        embedding_function=embeddings
-    )
-    vectorstore = vdb.from_documents(
-        documents=docs, 
+    print("First chunk:")
+    print(docs[0].page_content[:500])
+    vectorstore = Chroma.from_documents(
+        documents=docs,
         embedding=embeddings,
         persist_directory="./chroma_db_Vermaanant",
-        collection_name="ollama_test")
+        collection_name="ollama_test"
+    )
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 5}
@@ -53,7 +70,6 @@ def build_rag(pdf_path):
         max_tokens=512,
         temperature=0.3
     )
-    local_llm
     prompt_template = """
         You are a helpful assistant.
 
@@ -75,8 +91,6 @@ def build_rag(pdf_path):
         """
 
     prompt = PromptTemplate.from_template(prompt_template)
-
-    prompt
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=local_llm,

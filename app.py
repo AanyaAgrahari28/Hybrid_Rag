@@ -5,7 +5,13 @@ from rag_utils import build_rag
 
 st.set_page_config(page_title="Hybrid RAG")
 
-st.title("📄 Hybrid RAG")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "current_pdf" not in st.session_state:
+    st.session_state.current_pdf = None
+
+st.title("Hybrid RAG")
 
 uploaded_file = st.file_uploader(
     "Upload a PDF",
@@ -18,28 +24,59 @@ if uploaded_file:
         tmp.write(uploaded_file.read())
         pdf_path = tmp.name
 
-    if "qa_chain" not in st.session_state:
+    if (
+        "qa_chain" not in st.session_state
+        or st.session_state.current_pdf != uploaded_file.name
+    ):
 
         with st.spinner("Processing PDF..."):
             st.session_state.qa_chain = build_rag(pdf_path)
 
-        st.success("PDF processed successfully!")
+        st.session_state.current_pdf = uploaded_file.name
+        st.session_state.chat_history = []
 
-    question = st.text_input("Ask a question")
+        st.success("Document processed successfully.")
 
-    if st.button("Ask"):
+    question = st.chat_input("Ask a question...")
 
-        st.write("Button clicked!")
+    if question:
 
-        if question:
+        with st.spinner("Searching the document and generating answer..."):
 
-            st.write("Question:", question)
+            result = st.session_state.qa_chain.invoke(
+                {"query": question}
+            )
 
-            with st.spinner("Generating answer..."):
+        st.session_state.chat_history.append(
+            {
+                "question": question,
+                "answer": result["result"]
+            }
+        )
 
-                result = st.session_state.qa_chain.invoke(
-                    {"query": question}
+        st.rerun()
+
+    if st.session_state.chat_history:
+
+        st.divider()
+        st.subheader("Conversation")
+
+        for chat in st.session_state.chat_history:
+
+            with st.container(border=True):
+
+                st.markdown(
+                    f":material/account_circle: **You**\n\n{chat['question']}"
                 )
+                st.markdown("---")
+                st.markdown(
+                    ":material/smart_toy: **Chatbot**"
+                )
+                st.markdown(chat["answer"])
 
-            st.subheader("Answer")
-            st.write(result["result"])
+            st.divider()
+
+
+    if st.button(":material/delete: Clear Chat"):
+        st.session_state.chat_history = []
+        st.rerun()
