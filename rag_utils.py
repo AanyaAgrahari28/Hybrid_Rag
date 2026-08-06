@@ -18,6 +18,8 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.prompts import PromptTemplate
 from langchain_classic.chains import RetrievalQA
 
+from sentence_transformers import CrossEncoder
+
 def build_rag(pdf_path): 
     
     # Load documents and split into chunks
@@ -49,8 +51,16 @@ def build_rag(pdf_path):
         model="nomic-embed-text",
         dimensions=768
     )
+
+    reranker = CrossEncoder(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    )
+
+    print("Cross Encoder loaded successfully.")
+
     print("First chunk:")
     print(docs[0].page_content[:500])
+    
     vectorstore = Chroma.from_documents(
         documents=docs,
         embedding=embeddings,
