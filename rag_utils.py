@@ -1,6 +1,7 @@
 # import dependencies
 import sys
 import langchain
+import uuid
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -19,6 +20,29 @@ from langchain_core.prompts import PromptTemplate
 from langchain_classic.chains import RetrievalQA
 
 from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder(
+    "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+
+print("Cross Encoder loaded successfully.")
+
+def rerank_documents(question, documents, top_k=3):
+
+    pairs = [
+        (question, doc.page_content)
+        for doc in documents
+    ]
+
+    scores = reranker.predict(pairs)
+
+    ranked_docs = sorted(
+        zip(scores, documents),
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    return [doc for score, doc in ranked_docs[:top_k]]
 
 def build_rag(pdf_path): 
     
@@ -52,21 +76,16 @@ def build_rag(pdf_path):
         dimensions=768
     )
 
-    reranker = CrossEncoder(
-        "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    )
-
-    print("Cross Encoder loaded successfully.")
-
     print("First chunk:")
     print(docs[0].page_content[:500])
-    
+
+    collection_name = f"pdf_{uuid.uuid4().hex}"
+
     vectorstore = Chroma.from_documents(
-        documents=docs,
-        embedding=embeddings,
-        persist_directory="./chroma_db_Vermaanant",
-        collection_name="ollama_test"
-    )
+    documents=docs,
+    embedding=embeddings
+)
+    
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 5}
@@ -77,38 +96,73 @@ def build_rag(pdf_path):
         retrievers=[retriever, bm25_retriever],
         weights=[0.5, 0.5]
     )
-    retriever.invoke("What is the main topic of the paper?")
+
     local_llm =ChatOllama(
         model = 'gemma4:e4b',
         max_tokens=512,
         temperature=0.3
     )
+
     prompt_template = """
-        You are a helpful assistant.
+    You are an Enterprise Knowledge Assistant.
 
-        Answer ONLY using the retrieved context.
+    Your task is to answer questions ONLY using the retrieved context from the uploaded document.
 
-        Keep the answer concise.
+    Rules:
+    1. Never use outside knowledge.
+    2. Never hallucinate or guess.
+    3. If the answer is not found in the retrieved context, reply:
+    "I don't know based on the uploaded document."
+    4. Prefer precise information over lengthy explanations.
+    5. Preserve names, numbers, dates, formulas, technical terms, and definitions exactly as written.
+    6. Remove duplicate information.
+    7. Keep responses clear, professional, and well-structured.
 
-        If the user asks for a summary, answer in 5-8 bullet points.
+    Response Style:
 
-        If the answer is not present, say "I don't know."
+    • If the user asks to summarize:
+    - Give a concise summary in 5-8 bullet points.
 
-        Context:
-        {context}
+    • If the user asks for important points, key points, highlights, or takeaways:
+    - Return the most important facts as bullet points.
 
-        Question:
-        {question}
+    • If the user asks to explain:
+    - Explain step by step with headings.
 
-        Answer:
-        """
+    • If the user asks "what is" or "define":
+    - Give a short definition first, then a brief explanation.
+
+    • If the user asks to compare:
+    - Use a markdown table whenever possible.
+
+    • If the user asks to list:
+    - Return a clean bullet list.
+
+    • If the user asks for advantages/disadvantages:
+    - Use separate headings.
+
+    • If the user asks for steps or process:
+    - Use a numbered list.
+
+    • If the answer contains multiple topics:
+    - Organize using headings and bullet points.
+
+    • Keep answers concise unless the user explicitly asks for a detailed explanation.
+
+    Retrieved Context:
+    {context}
+
+    Question:
+    {question}
+
+    Answer:
+    """
 
     prompt = PromptTemplate.from_template(prompt_template)
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=local_llm,
-        chain_type = "stuff",
-        retriever=hybrid_retriever,
-        verbose=True)
-    return qa_chain
+    return {
+    "retriever": hybrid_retriever,
+    "llm": local_llm,
+    "prompt": prompt,
+}
 

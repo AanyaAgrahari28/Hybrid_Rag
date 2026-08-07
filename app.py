@@ -1,7 +1,10 @@
 import streamlit as st
 import tempfile
 
-from rag_utils import build_rag
+from rag_utils import (
+    build_rag,
+    rerank_documents,
+)
 
 st.set_page_config(page_title="Hybrid RAG")
 
@@ -47,14 +50,34 @@ if uploaded_file:
 
         with st.spinner("Searching the document and generating answer..."):
 
-            result = st.session_state.qa_chain.invoke(
-                {"query": question}
+            rag = st.session_state.qa_chain
+
+            retriever = rag["retriever"]
+            llm = rag["llm"]
+            prompt = rag["prompt"]
+
+            docs = retriever.invoke(question)
+
+            reranked_docs = rerank_documents(
+                question,
+                docs
             )
+
+            context = "\n\n".join(
+                doc.page_content for doc in reranked_docs
+            )
+
+            formatted_prompt = prompt.format(
+                context=context,
+                question=question
+            )
+
+            result = llm.invoke(formatted_prompt)
 
         st.session_state.chat_history.append(
             {
                 "question": question,
-                "answer": result["result"]
+                "answer": result.content
             }
         )
 
