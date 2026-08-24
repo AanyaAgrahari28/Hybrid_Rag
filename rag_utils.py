@@ -42,31 +42,55 @@ def rerank_documents(question, documents, top_k=3):
         reverse=True
     )
 
-    return [doc for score, doc in ranked_docs[:top_k]]
+    final_docs = []
 
-def build_rag(pdf_path): 
+    for score, doc in ranked_docs[:top_k]:
+        doc.metadata["rerank_score"] = float(score)
+        final_docs.append(doc)
+
+    return final_docs
+
+def build_rag(pdf_paths): 
     
     # Load documents and split into chunks
-    try:
-        loader = PyPDFLoader(pdf_path)
-        documents = loader.load()
+    # Load documents from all uploaded PDFs
+    all_documents = []
 
-    except Exception:
+    for pdf_path, pdf_name in pdf_paths:
 
         try:
-            loader = PyMuPDFLoader(pdf_path)
+            loader = PyPDFLoader(pdf_path)
             documents = loader.load()
 
         except Exception:
+            try:
+                loader = PyMuPDFLoader(pdf_path)
+                documents = loader.load()
+
+            except Exception:
+                raise ValueError(
+                    f"Unable to process '{pdf_name}'. "
+                    "It may be protected, corrupted, or unsupported."
+                )
+
+        if not documents:
             raise ValueError(
-                "Unable to process this PDF. It may be protected, corrupted, or unsupported."
+                f"No text could be extracted from '{pdf_name}'."
             )
-    if not documents:
-        raise ValueError("No text could be extracted from this PDF.")
+
+        # Preserve the original PDF name for future citations
+        for doc in documents:
+            doc.metadata["source_file"] = pdf_name
+
+        all_documents.extend(documents)
     
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=75)
-    docs = text_splitter.split_documents(documents)
-    print("Documents:", len(documents))
+    docs = text_splitter.split_documents(all_documents)
+
+    for i, doc in enumerate(docs):
+        doc.metadata["chunk_id"] = i + 1
+
+    print("Documents:", len(all_documents))
     print("Chunks:", len(docs))
 
     if len(docs) == 0:
@@ -81,11 +105,14 @@ def build_rag(pdf_path):
 
     collection_name = f"pdf_{uuid.uuid4().hex}"
 
+    print("Creating Chroma...")
+
     vectorstore = Chroma.from_documents(
     documents=docs,
-    embedding=embeddings
+    embedding=embeddings,
 )
-    
+    print("Chroma created successfully.")
+
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 5}
@@ -106,13 +133,13 @@ def build_rag(pdf_path):
     prompt_template = """
     You are an Enterprise Knowledge Assistant.
 
-    Your task is to answer questions ONLY using the retrieved context from the uploaded document.
+    Your task is to answer questions ONLY using the retrieved context from the uploaded documents.
 
     Rules:
     1. Never use outside knowledge.
     2. Never hallucinate or guess.
     3. If the answer is not found in the retrieved context, reply:
-    "I don't know based on the uploaded document."
+    "I don't know based on the uploaded documents."
     4. Prefer precise information over lengthy explanations.
     5. Preserve names, numbers, dates, formulas, technical terms, and definitions exactly as written.
     6. Remove duplicate information.
