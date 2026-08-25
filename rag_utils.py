@@ -27,7 +27,7 @@ reranker = CrossEncoder(
 
 print("Cross Encoder loaded successfully.")
 
-def rerank_documents(question, documents, top_k=3):
+def rerank_documents(question, documents, top_k=6):
 
     pairs = [
         (question, doc.page_content)
@@ -49,6 +49,57 @@ def rerank_documents(question, documents, top_k=3):
         final_docs.append(doc)
 
     return final_docs
+
+def balanced_multi_document_retrieval(
+    question,
+    document_retrievers,
+    total_k=6,
+    per_document_k=6
+):
+    all_docs = []
+
+    # Retrieve from each document separately
+    for document_retriever in document_retrievers.values():
+        all_docs.extend(
+            document_retriever.invoke(question)
+        )
+
+    # Remove duplicate chunks
+    unique_docs = {}
+    for doc in all_docs:
+        key = (
+            doc.metadata.get("source_file"),
+            doc.metadata.get("chunk_id")
+        )
+        unique_docs[key] = doc
+
+    docs = list(unique_docs.values())
+
+    # Rerank all candidates together
+    ranked_docs = rerank_documents(
+        question,
+        docs,
+        top_k=len(docs)
+    )
+
+    # Make sure each document contributes at least one chunk
+    selected_docs = []
+
+    for source_file in document_retrievers:
+        for doc in ranked_docs:
+            if doc.metadata.get("source_file") == source_file:
+                selected_docs.append(doc)
+                break
+
+    # Fill remaining slots with highest-ranked chunks
+    for doc in ranked_docs:
+        if len(selected_docs) >= total_k:
+            break
+
+        if doc not in selected_docs:
+            selected_docs.append(doc)
+
+    return selected_docs[:total_k]
 
 def build_rag(pdf_paths): 
     
@@ -115,14 +166,40 @@ def build_rag(pdf_paths):
 
     retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 5}
+        search_kwargs={"k": 10}
     )
     bm25_retriever = BM25Retriever.from_documents(docs)
-    bm25_retriever.k = 5
+    bm25_retriever.k = 10
     hybrid_retriever = EnsembleRetriever(
         retrievers=[retriever, bm25_retriever],
         weights=[0.5, 0.5]
     )
+
+    document_retrievers = {}
+
+    for source_file in set(doc.metadata["source_file"] for doc in docs):
+        source_docs = [
+            doc for doc in docs
+            if doc.metadata["source_file"] == source_file
+        ]
+
+        source_bm25 = BM25Retriever.from_documents(source_docs)
+        source_bm25.k = 6
+
+        source_vectorstore = Chroma.from_documents(
+            documents=source_docs,
+            embedding=embeddings
+        )
+
+        source_vector = source_vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 6}
+        )
+
+        document_retrievers[source_file] = EnsembleRetriever(
+            retrievers=[source_vector, source_bm25],
+            weights=[0.5, 0.5]
+        )
 
     local_llm =ChatOllama(
         model = 'gemma4:e4b',
@@ -189,6 +266,7 @@ def build_rag(pdf_paths):
 
     return {
     "retriever": hybrid_retriever,
+    "document_retrievers": document_retrievers,
     "llm": local_llm,
     "prompt": prompt,
 }
