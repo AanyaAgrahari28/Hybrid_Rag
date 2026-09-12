@@ -1,10 +1,14 @@
 import streamlit as st
 import tempfile
+import time
 
 from rag_utils import (
     build_rag,
     rerank_documents,
     balanced_multi_document_retrieval,
+    filter_documents_by_metadata,
+    prioritize_recent_documents,
+    rewrite_query,
 )
 
 def is_multi_document_question(question, uploaded_names):
@@ -74,11 +78,25 @@ st.title("Hybrid RAG")
 
 with st.sidebar:
     st.header("📄 Documents")
+    top_k = st.slider(
+        "Number of relevant chunks",
+        min_value=2,
+        max_value=10,
+        value=6,
+        step=1
+    )    
 
     uploaded_files = st.file_uploader(
         "Upload PDFs",
         type="pdf",
         accept_multiple_files=True
+    )
+
+    uploaded_names = [file.name for file in uploaded_files]
+
+    selected_document = st.selectbox(
+        "Filter by document",
+        ["All documents"] + uploaded_names
     )
 
 if uploaded_files:
@@ -116,12 +134,17 @@ if uploaded_files:
 
         with st.spinner("Searching the document and generating answer..."):
 
+            retrieval_start = time.time()
+
             rag = st.session_state.qa_chain
 
             retriever = rag["retriever"]
             document_retrievers = rag["document_retrievers"]
             llm = rag["llm"]
             prompt = rag["prompt"]
+
+            rewritten_question = rewrite_query(question, llm)
+            initial_retrieved_count = 0
 
             is_multi_document = (
                 len(uploaded_names) > 1
@@ -133,16 +156,28 @@ if uploaded_files:
 
             if is_multi_document:
                 reranked_docs = balanced_multi_document_retrieval(
-                    question,
-                    document_retrievers
+                    rewritten_question,
+                    document_retrievers,
+                    total_k=top_k
                 )
             else:
-                docs = retriever.invoke(question)
+                docs = retriever.invoke(rewritten_question)
+                initial_retrieved_count = len(docs)
+                if selected_document != "All documents":
+                    docs = filter_documents_by_metadata(
+                        docs,
+                        source_file=selected_document
+                    )
 
                 reranked_docs = rerank_documents(
-                    question,
-                    docs
+                    rewritten_question,
+                    docs,
+                    top_k=top_k
                 )
+                reranked_docs = prioritize_recent_documents(reranked_docs)
+                reranked_docs = reranked_docs[:top_k]
+
+            retrieval_time = time.time() - retrieval_start
 
             context = "\n\n".join(
                 doc.page_content for doc in reranked_docs
@@ -174,11 +209,18 @@ if uploaded_files:
 
             result = llm.invoke(formatted_prompt)
 
+            st.markdown("### 🔍 Retrieval Diagnostics")
+
+            st.write(f"**Retrieval latency:** {retrieval_time:.3f} seconds")
+            st.write(f"**Final chunks used:** {len(reranked_docs)}")
+
         st.session_state.chat_history.append(
             {
                 "question": question,
                 "answer": result.content,
-                "sources": sources
+                "sources": sources,
+                "retrieval_time": retrieval_time,
+                "final_chunks": len(reranked_docs)
             }
         )
 
@@ -201,9 +243,29 @@ if uploaded_files:
                     ":material/smart_toy: **Chatbot**"
                 )
                 st.markdown(chat["answer"])
+                with st.expander("📚 Sources & Retrieval Details"):
 
-                if chat.get("sources"):
-                    with st.expander("📚 Sources & Retrieval Details"):
+                    with st.expander("🔍 Retrieval Diagnostics"):
+                        st.write(
+                            f"**Retrieval latency:** {chat['retrieval_time']:.3f} seconds"
+                        )
+                        st.write(
+                            f"**Final chunks used:** {chat['final_chunks']}"
+                        )
+
+                    for item in chat["sources"]:
+                        score = item.get("score")
+
+                        if score is not None:
+                            score_text = f"{score:.4f}"
+                        else:
+                            score_text = "N/A"
+
+                        st.markdown(
+                            f"- **{item['source']}**  \n"
+                            f"  Chunk ID: `{item['chunk_id']}`  |  "
+                            f"Cross-Encoder Score: `{score_text}`"
+                        )
 
                         for item in chat["sources"]:
                             score = item.get("score")
