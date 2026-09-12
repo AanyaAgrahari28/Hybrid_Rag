@@ -20,6 +20,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_classic.chains import RetrievalQA
 
 from sentence_transformers import CrossEncoder
+from datetime import datetime
 
 reranker = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -101,6 +102,94 @@ def balanced_multi_document_retrieval(
 
     return selected_docs[:total_k]
 
+def filter_documents_by_metadata(documents, source_file=None, page_number=None):
+    """
+    Filter retrieved documents using metadata.
+
+    Args:
+        documents: List of LangChain Documents
+        source_file: Optional PDF filename to filter by
+        page_number: Optional page number to filter by
+
+    Returns:
+        Filtered list of documents
+    """
+
+    filtered_docs = documents
+
+    if source_file:
+        filtered_docs = [
+            doc for doc in filtered_docs
+            if doc.metadata.get("source_file") == source_file
+        ]
+
+    if page_number is not None:
+        filtered_docs = [
+            doc for doc in filtered_docs
+            if doc.metadata.get("page") == page_number
+        ]
+
+    return filtered_docs
+
+def prioritize_recent_documents(documents, recent_boost=0.15):
+    """
+    Give a small ranking boost to documents uploaded more recently.
+    """
+
+    now = datetime.now()
+
+    for doc in documents:
+        upload_time = doc.metadata.get("upload_time")
+
+        if upload_time:
+            try:
+                upload_time = datetime.fromisoformat(upload_time)
+
+                age_days = max((now - upload_time).total_seconds() / 86400, 0)
+
+                # Smaller age = larger boost
+                boost = recent_boost / (1 + age_days)
+
+                current_score = doc.metadata.get("rerank_score", 0)
+                doc.metadata["rerank_score"] = current_score + boost
+
+            except (ValueError, TypeError):
+                pass
+
+    return sorted(
+        documents,
+        key=lambda doc: doc.metadata.get("rerank_score", 0),
+        reverse=True
+    )
+
+def rewrite_query(question, llm):
+    """
+    Rewrite a user's question into a clear, retrieval-friendly query.
+    """
+
+    rewrite_prompt = f"""
+You are a query rewriting assistant for an enterprise document search system.
+
+Rewrite the user's question into a clear and precise search query.
+
+Rules:
+- Preserve the original meaning.
+- Do not add information that is not present in the question.
+- Resolve obvious conversational wording.
+- Keep important names, terms, numbers, and dates.
+- Return ONLY the rewritten query.
+- Do not answer the question.
+
+User question:
+{question}
+
+Rewritten query:
+"""
+
+    response = llm.invoke(rewrite_prompt)
+
+    return response.content.strip()
+
 def build_rag(pdf_paths): 
     
     # Load documents and split into chunks
@@ -108,6 +197,7 @@ def build_rag(pdf_paths):
     all_documents = []
 
     for pdf_path, pdf_name in pdf_paths:
+        upload_time = datetime.now().isoformat()
 
         try:
             loader = PyPDFLoader(pdf_path)
@@ -132,6 +222,7 @@ def build_rag(pdf_paths):
         # Preserve the original PDF name for future citations
         for doc in documents:
             doc.metadata["source_file"] = pdf_name
+            doc.metadata["upload_time"] = upload_time
 
         all_documents.extend(documents)
     
