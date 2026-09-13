@@ -22,6 +22,13 @@ from langchain_classic.chains import RetrievalQA
 from sentence_transformers import CrossEncoder
 from datetime import datetime
 
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    PyMuPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+)
+
 reranker = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
@@ -65,40 +72,77 @@ def balanced_multi_document_retrieval(
             document_retriever.invoke(question)
         )
 
-    # Remove duplicate chunks
+    # Remove duplicate chunks using a stable chunk identity
     unique_docs = {}
+
     for doc in all_docs:
-        key = (
-            doc.metadata.get("source_file"),
-            doc.metadata.get("chunk_id")
-        )
-        unique_docs[key] = doc
+        source_file = str(
+            doc.metadata.get("source_file", "")
+        ).strip()
+
+        chunk_id = str(
+            doc.metadata.get("chunk_id", "")
+        ).strip()
+
+        key = (source_file, chunk_id)
+
+        if key not in unique_docs:
+            unique_docs[key] = doc
 
     docs = list(unique_docs.values())
 
-    # Rerank all candidates together
+    # Rerank all unique candidates
     ranked_docs = rerank_documents(
         question,
         docs,
         top_k=len(docs)
     )
 
-    # Make sure each document contributes at least one chunk
+    # Select at least one unique chunk from each document
     selected_docs = []
+    selected_keys = set()
 
     for source_file in document_retrievers:
+
         for doc in ranked_docs:
-            if doc.metadata.get("source_file") == source_file:
+
+            doc_source = str(
+                doc.metadata.get("source_file", "")
+            ).strip()
+
+            chunk_id = str(
+                doc.metadata.get("chunk_id", "")
+            ).strip()
+
+            key = (doc_source, chunk_id)
+
+            if (
+                doc_source == source_file
+                and key not in selected_keys
+            ):
                 selected_docs.append(doc)
+                selected_keys.add(key)
                 break
 
-    # Fill remaining slots with highest-ranked chunks
+    # Fill remaining slots with highest-ranked UNIQUE chunks
     for doc in ranked_docs:
+
         if len(selected_docs) >= total_k:
             break
 
-        if doc not in selected_docs:
+        doc_source = str(
+            doc.metadata.get("source_file", "")
+        ).strip()
+
+        chunk_id = str(
+            doc.metadata.get("chunk_id", "")
+        ).strip()
+
+        key = (doc_source, chunk_id)
+
+        if key not in selected_keys:
             selected_docs.append(doc)
+            selected_keys.add(key)
 
     return selected_docs[:total_k]
 
@@ -190,29 +234,54 @@ Rewritten query:
 
     return response.content.strip()
 
-def build_rag(pdf_paths): 
+def load_document(file_path, file_name):
+
+    extension = file_name.lower().rsplit(".", 1)[-1]
+
+    if extension == "pdf":
+        try:
+            loader = PyPDFLoader(file_path)
+            return loader.load()
+        except Exception:
+            loader = PyMuPDFLoader(file_path)
+            return loader.load()
+
+    elif extension == "docx":
+        loader = Docx2txtLoader(file_path)
+        return loader.load()
+
+    elif extension in ["txt", "md"]:
+        loader = TextLoader(
+            file_path,
+            encoding="utf-8"
+        )
+        return loader.load()
+
+    else:
+        raise ValueError(
+            f"Unsupported file type: .{extension}"
+        )
+
+def build_rag(document_paths): 
     
     # Load documents and split into chunks
     # Load documents from all uploaded PDFs
     all_documents = []
 
-    for pdf_path, pdf_name in pdf_paths:
+    for document_path, document_name in document_paths:
         upload_time = datetime.now().isoformat()
 
         try:
-            loader = PyPDFLoader(pdf_path)
-            documents = loader.load()
+            documents = load_document(
+                document_path,
+                document_name
+            )
 
         except Exception:
-            try:
-                loader = PyMuPDFLoader(pdf_path)
-                documents = loader.load()
-
-            except Exception:
-                raise ValueError(
-                    f"Unable to process '{pdf_name}'. "
-                    "It may be protected, corrupted, or unsupported."
-                )
+            raise ValueError(
+                f"Unable to process '{document_name}'. "
+                "The file may be corrupted or unsupported."
+            )
 
         if not documents:
             raise ValueError(
@@ -221,7 +290,7 @@ def build_rag(pdf_paths):
 
         # Preserve the original PDF name for future citations
         for doc in documents:
-            doc.metadata["source_file"] = pdf_name
+            doc.metadata["source_file"] = document_name
             doc.metadata["upload_time"] = upload_time
 
         all_documents.extend(documents)
@@ -312,6 +381,11 @@ def build_rag(pdf_paths):
     5. Preserve names, numbers, dates, formulas, technical terms, and definitions exactly as written.
     6. Remove duplicate information.
     7. Keep responses clear, professional, and well-structured.
+    8. Cite factual statements using [1], [2], [3], etc.
+    9. Each citation number corresponds to the [SOURCE N] section in the retrieved context.
+    10. Never invent a citation number.
+    11. Place citations immediately after the statement they support.
+    12. If multiple sources support a statement, cite all relevant sources.
 
     Response Style:
 

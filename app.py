@@ -1,6 +1,7 @@
 import streamlit as st
 import tempfile
 import time
+from collections import defaultdict
 
 from rag_utils import (
     build_rag,
@@ -87,8 +88,8 @@ with st.sidebar:
     )    
 
     uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type="pdf",
+        "Upload documents",
+        type=["pdf", "docx", "txt", "md"],
         accept_multiple_files=True
     )
 
@@ -101,14 +102,26 @@ with st.sidebar:
 
 if uploaded_files:
 
-    pdf_paths = []
+    document_paths = []
 
     for uploaded_file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_file.read())
-            pdf_paths.append((tmp.name, uploaded_file.name))
 
-    uploaded_names = [name for _, name in pdf_paths]
+        extension = uploaded_file.name.rsplit(".", 1)[-1]
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=f".{extension}"
+        ) as tmp:
+
+            tmp.write(uploaded_file.read())
+
+            document_paths.append(
+                (tmp.name, uploaded_file.name)
+            )
+
+    uploaded_names = [
+        name for _, name in document_paths
+    ]
 
     if (
         "qa_chain" not in st.session_state
@@ -116,9 +129,9 @@ if uploaded_files:
         or st.session_state.current_pdf != uploaded_names
     ):
 
-        with st.spinner("Processing PDF..."):
+        with st.spinner("Processing documents..."):
             try:
-                st.session_state.qa_chain = build_rag(pdf_paths)
+                st.session_state.qa_chain = build_rag(document_paths)
 
             except Exception as e:
                 st.error(str(e))
@@ -179,27 +192,60 @@ if uploaded_files:
 
             retrieval_time = time.time() - retrieval_start
 
-            context = "\n\n".join(
-                doc.page_content for doc in reranked_docs
-            )
+            context_parts = []
+
+            for i, doc in enumerate(reranked_docs, start=1):
+
+                doc.metadata["citation_id"] = i
+
+                source_file = doc.metadata.get(
+                    "source_file",
+                    "Unknown"
+                )
+
+                page = doc.metadata.get(
+                    "page",
+                    "N/A"
+                )
+
+                chunk_id = doc.metadata.get(
+                    "chunk_id",
+                    "N/A"
+                )
+
+                context_parts.append(
+                    f"[SOURCE {i}]\n"
+                    f"Document: {source_file}\n"
+                    f"Page: {page}\n"
+                    f"Chunk: {chunk_id}\n"
+                    f"Content:\n"
+                    f"{doc.page_content}"
+                )
+
+            context = "\n\n".join(context_parts)
 
             sources = []
 
-            for doc in reranked_docs:
-                source_file = doc.metadata.get("source_file", "Unknown document")
-                page = doc.metadata.get("page")
-                chunk_id = doc.metadata.get("chunk_id", "N/A")
-                score = doc.metadata.get("rerank_score")
-
-                if page is not None:
-                    source_text = f"{source_file} — Page {page + 1}"
-                else:
-                    source_text = source_file
+            for i, doc in enumerate(reranked_docs, start=1):
 
                 sources.append({
-                    "source": source_text,
-                    "chunk_id": chunk_id,
-                    "score": score
+                    "citation_id": i,
+                    "source": doc.metadata.get(
+                        "source_file",
+                        "Unknown"
+                    ),
+                    "page": doc.metadata.get(
+                        "page",
+                        "N/A"
+                    ),
+                    "chunk_id": doc.metadata.get(
+                        "chunk_id",
+                        "N/A"
+                    ),
+                    "score": doc.metadata.get(
+                        "rerank_score",
+                        0
+                    ),
                 })
 
             formatted_prompt = prompt.format(
@@ -209,7 +255,7 @@ if uploaded_files:
 
             result = llm.invoke(formatted_prompt)
 
-            st.markdown("### 🔍 Retrieval Diagnostics")
+            st.write("### 🔍 Retrieval Diagnostics")
 
             st.write(f"**Retrieval latency:** {retrieval_time:.3f} seconds")
             st.write(f"**Final chunks used:** {len(reranked_docs)}")
@@ -243,42 +289,37 @@ if uploaded_files:
                     ":material/smart_toy: **Chatbot**"
                 )
                 st.markdown(chat["answer"])
+
                 with st.expander("📚 Sources & Retrieval Details"):
 
-                    with st.expander("🔍 Retrieval Diagnostics"):
-                        st.write(
-                            f"**Retrieval latency:** {chat['retrieval_time']:.3f} seconds"
-                        )
-                        st.write(
-                            f"**Final chunks used:** {chat['final_chunks']}"
-                        )
+                    st.write("### 🔍 Retrieval Diagnostics:")
+                    st.write(
+                        f"**Retrieval latency:** "
+                        f"{chat['retrieval_time']:.3f} seconds"
+                    )
+                    st.write(
+                        f"**Final chunks used:** "
+                        f"{chat['final_chunks']}"
+                    )
+
+                    st.write("### 📄 Sources")
+
+                    grouped_sources = defaultdict(list)
 
                     for item in chat["sources"]:
-                        score = item.get("score")
+                        grouped_sources[item["source"]].append(item)
 
-                        if score is not None:
-                            score_text = f"{score:.4f}"
-                        else:
-                            score_text = "N/A"
+                    for source_file, items in grouped_sources.items():
 
-                        st.markdown(
-                            f"- **{item['source']}**  \n"
-                            f"  Chunk ID: `{item['chunk_id']}`  |  "
-                            f"Cross-Encoder Score: `{score_text}`"
-                        )
+                        st.markdown(f"**📄 {source_file}**")
 
-                        for item in chat["sources"]:
-                            score = item.get("score")
-
-                            if score is not None:
-                                score_text = f"{score:.4f}"
-                            else:
-                                score_text = "N/A"
-
-                            st.markdown(
-                                f"- **{item['source']}**  \n"
-                                f"  Chunk ID: `{item['chunk_id']}`  |  "
-                                f"Cross-Encoder Score: `{score_text}`"
+                        for item in items:
+                            st.write(
+                                f"**[{item['citation_id']}]** "
+                                f"Page {item['page']} · "
+                                f"Chunk {item['chunk_id']} · "
+                                f"Rerank score: "
+                                f"{item['score']:.2f}"
                             )
 
             st.divider()
