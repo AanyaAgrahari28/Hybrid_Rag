@@ -2,6 +2,8 @@
 import sys
 import langchain
 import uuid
+import os
+import json
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -27,6 +29,12 @@ from langchain_community.document_loaders import (
     PyMuPDFLoader,
     Docx2txtLoader,
     TextLoader,
+)
+
+KNOWLEDGE_BASE_DIR = "knowledge_base"
+DOCUMENT_REGISTRY = os.path.join(
+    KNOWLEDGE_BASE_DIR,
+    "documents.json"
 )
 
 reranker = CrossEncoder(
@@ -262,6 +270,35 @@ def load_document(file_path, file_name):
             f"Unsupported file type: .{extension}"
         )
 
+def load_document_registry():
+
+    os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
+
+    if not os.path.exists(DOCUMENT_REGISTRY):
+        return []
+
+    with open(
+        DOCUMENT_REGISTRY,
+        "r",
+        encoding="utf-8"
+    ) as f:
+        return json.load(f)
+
+def save_document_registry(documents):
+
+    os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
+
+    with open(
+        DOCUMENT_REGISTRY,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            documents,
+            f,
+            indent=4
+        )
+
 def build_rag(document_paths): 
     
     # Load documents and split into chunks
@@ -285,7 +322,7 @@ def build_rag(document_paths):
 
         if not documents:
             raise ValueError(
-                f"No text could be extracted from '{pdf_name}'."
+                f"No text could be extracted from '{document_name}'."
             )
 
         # Preserve the original PDF name for future citations
@@ -297,6 +334,34 @@ def build_rag(document_paths):
     
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=75)
     docs = text_splitter.split_documents(all_documents)
+    registry = load_document_registry()
+
+    for document_name in set(
+        doc.metadata["source_file"] for doc in docs
+    ):
+        document_chunks = [
+            doc for doc in docs
+            if doc.metadata["source_file"] == document_name
+        ]
+
+        existing = next(
+            (
+                item for item in registry
+                if item["filename"] == document_name
+            ),
+            None
+        )
+
+        if existing is None:
+            registry.append({
+                "filename": document_name,
+                "file_type": document_name.rsplit(".", 1)[-1],
+                "upload_time": datetime.now().isoformat(),
+                "chunks": len(document_chunks)
+            })
+
+    save_document_registry(registry)
+
 
     for i, doc in enumerate(docs):
         doc.metadata["chunk_id"] = i + 1
@@ -319,9 +384,14 @@ def build_rag(document_paths):
     print("Creating Chroma...")
 
     vectorstore = Chroma.from_documents(
-    documents=docs,
-    embedding=embeddings,
-)
+        documents=docs,
+        embedding=embeddings,
+        persist_directory=os.path.join(
+        KNOWLEDGE_BASE_DIR,
+        "chroma_db"
+    ),
+        collection_name="enterprise_documents",
+    )
     print("Chroma created successfully.")
 
     retriever = vectorstore.as_retriever(

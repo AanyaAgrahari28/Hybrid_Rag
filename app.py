@@ -1,6 +1,8 @@
 import streamlit as st
 import tempfile
 import time
+import os
+import shutil
 from collections import defaultdict
 
 from rag_utils import (
