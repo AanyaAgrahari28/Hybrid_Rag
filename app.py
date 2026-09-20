@@ -12,6 +12,10 @@ from rag_utils import (
     filter_documents_by_metadata,
     prioritize_recent_documents,
     rewrite_query,
+    load_existing_rag,
+    get_knowledge_base_documents,
+    retrieve_with_query_fusion,
+    route_documents,
 )
 
 def is_multi_document_question(question, uploaded_names):
@@ -71,77 +75,173 @@ def is_multi_document_question(question, uploaded_names):
 
 st.set_page_config(page_title="Hybrid RAG")
 
+def get_authorized_documents(knowledge_base_documents, allowed_departments):
+    """Return only documents the current role is authorized to access."""
+
+    if "ALL" in allowed_departments:
+        return knowledge_base_documents
+
+    return [
+        (file_path, file_name)
+        for file_path, file_name in knowledge_base_documents
+        if os.path.basename(
+            os.path.dirname(file_path)
+        ) in allowed_departments
+    ]
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 if "current_pdf" not in st.session_state:
     st.session_state.current_pdf = None
+    
+uploaded_names = []
+
+# Role-based department access
+ROLE_DEPARTMENTS = {
+    "Admin": ["ALL"],
+    "HR User": ["People_HR"],
+    "IT User": ["Engineering_IT", "Information_Security"],
+    "Finance User": ["Finance"],
+    "Legal/Compliance User": ["Legal_Compliance"],
+}
 
 st.title("Hybrid RAG")
 
 with st.sidebar:
     st.header("📄 Documents")
+
+    role = st.selectbox(
+        "Role",
+        list(ROLE_DEPARTMENTS.keys())
+    )
+    # Reset the RAG session when the user's role changes
+    if "active_role" not in st.session_state:
+        st.session_state.active_role = role
+
+    elif st.session_state.active_role != role:
+        st.session_state.active_role = role
+        st.session_state.qa_chain = None
+        st.session_state.chat_history = []
+        st.rerun()
+
+    allowed_departments = ROLE_DEPARTMENTS[role]
+
+    knowledge_base_documents = get_knowledge_base_documents()
+
+    authorized_documents = get_authorized_documents(
+    knowledge_base_documents,
+    allowed_departments
+    )
+
     top_k = st.slider(
         "Number of relevant chunks",
         min_value=2,
         max_value=10,
         value=6,
         step=1
-    )    
-
-    uploaded_files = st.file_uploader(
-        "Upload documents",
-        type=["pdf", "docx", "txt", "md"],
-        accept_multiple_files=True
     )
 
-    uploaded_names = [file.name for file in uploaded_files]
+    if role == "Admin":
+        st.markdown("### 📚 Knowledge Base")
+
+        departments = defaultdict(list)
+
+        for file_path, file_name in knowledge_base_documents:
+            department = os.path.basename(
+                os.path.dirname(file_path)
+            )
+            departments[department].append(file_name)
+
+        for department, files in sorted(departments.items()):
+            with st.expander(f"📁 {department}"):
+                for file_name in sorted(files):
+                    st.write(f"📄 {file_name}")
+
+        st.markdown("### ⬆️ Upload Documents")
+
+        uploaded_files = st.file_uploader(
+            "Upload documents",
+            type=["pdf", "docx", "txt", "md"],
+            accept_multiple_files=True
+        )
+
+    else:
+        uploaded_files = []
+        uploaded_names = []
+
+    all_document_names = [
+    name for _, name in authorized_documents
+]
 
     selected_document = st.selectbox(
         "Filter by document",
-        ["All documents"] + uploaded_names
+        ["All documents"] + all_document_names
     )
 
-if uploaded_files:
+# Load permanent knowledge base on startup
+if (
+    "qa_chain" not in st.session_state
+    or st.session_state.qa_chain is None
+):
+    knowledge_base_documents = authorized_documents
 
-    document_paths = []
-
-    for uploaded_file in uploaded_files:
-
-        extension = uploaded_file.name.rsplit(".", 1)[-1]
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=f".{extension}"
-        ) as tmp:
-
-            tmp.write(uploaded_file.read())
-
-            document_paths.append(
-                (tmp.name, uploaded_file.name)
-            )
-
-    uploaded_names = [
-        name for _, name in document_paths
-    ]
-
-    if (
-        "qa_chain" not in st.session_state
-        or "document_retrievers" not in st.session_state.qa_chain
-        or st.session_state.current_pdf != uploaded_names
-    ):
-
-        with st.spinner("Processing documents..."):
+    if knowledge_base_documents:
+        with st.spinner("Loading enterprise knowledge base..."):
             try:
-                st.session_state.qa_chain = build_rag(document_paths)
-
+                st.session_state.qa_chain = load_existing_rag(
+                    authorized_documents
+                )
+                st.session_state.current_pdf = [
+                    name for _, name in knowledge_base_documents
+                ]
+                st.session_state.chat_history = []
             except Exception as e:
                 st.error(str(e))
                 st.stop()
-        st.session_state.current_pdf = uploaded_names
-        st.session_state.chat_history = []
 
-        st.success(f"{len(uploaded_files)} documents processed successfully.")
+if "qa_chain" in st.session_state:
+
+    if uploaded_files:
+
+        document_paths = []
+
+        for uploaded_file in uploaded_files:
+
+            extension = uploaded_file.name.rsplit(".", 1)[-1]
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=f".{extension}"
+            ) as tmp:
+
+                tmp.write(uploaded_file.read())
+
+                document_paths.append(
+                    (tmp.name, uploaded_file.name)
+                )
+
+        uploaded_names = [
+            name for _, name in document_paths
+        ]
+
+        if (
+            "qa_chain" not in st.session_state
+            or "document_retrievers" not in st.session_state.qa_chain
+            or st.session_state.current_pdf != uploaded_names
+        ):
+
+            with st.spinner("Processing documents..."):
+                try:
+                    st.session_state.qa_chain = build_rag(document_paths)
+
+                except Exception as e:
+                    st.error(str(e))
+                    st.stop()
+            st.session_state.current_pdf = uploaded_names
+            st.session_state.chat_history = []
+
+            st.success(f"{len(uploaded_files)} documents processed successfully.")
 
     question = st.chat_input("Ask a question...")
 
@@ -155,6 +255,7 @@ if uploaded_files:
 
             retriever = rag["retriever"]
             document_retrievers = rag["document_retrievers"]
+            document_router = rag["document_router"]
             llm = rag["llm"]
             prompt = rag["prompt"]
 
@@ -162,10 +263,10 @@ if uploaded_files:
             initial_retrieved_count = 0
 
             is_multi_document = (
-                len(uploaded_names) > 1
+                len(all_document_names) > 1
                 and is_multi_document_question(
                     question,
-                    uploaded_names
+                    all_document_names
                 )
             )
 
@@ -176,8 +277,27 @@ if uploaded_files:
                     total_k=top_k
                 )
             else:
-                docs = retriever.invoke(rewritten_question)
+                routed_documents = route_documents(
+                    rewritten_question,
+                    document_router,
+                    document_retrievers,
+                    max_documents=3
+                )
+
+                routed_retrievers = {
+                    source_file: document_retrievers[source_file]
+                    for source_file in routed_documents
+                }
+
+                docs = []
+
+                for source_file, document_retriever in routed_retrievers.items():
+                    docs.extend(
+                        document_retriever.invoke(rewritten_question)
+                    )
+
                 initial_retrieved_count = len(docs)
+
                 if selected_document != "All documents":
                     docs = filter_documents_by_metadata(
                         docs,
@@ -185,11 +305,15 @@ if uploaded_files:
                     )
 
                 reranked_docs = rerank_documents(
-                    rewritten_question,
+                    question,
                     docs,
                     top_k=top_k
                 )
-                reranked_docs = prioritize_recent_documents(reranked_docs)
+
+                reranked_docs = prioritize_recent_documents(
+                    reranked_docs
+                )
+
                 reranked_docs = reranked_docs[:top_k]
 
             retrieval_time = time.time() - retrieval_start

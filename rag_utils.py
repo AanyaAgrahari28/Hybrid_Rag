@@ -31,6 +31,9 @@ from langchain_community.document_loaders import (
     TextLoader,
 )
 
+from docx import Document as DocxDocument
+from langchain_core.documents import Document
+
 KNOWLEDGE_BASE_DIR = "knowledge_base"
 DOCUMENT_REGISTRY = os.path.join(
     KNOWLEDGE_BASE_DIR,
@@ -242,6 +245,41 @@ Rewritten query:
 
     return response.content.strip()
 
+def retrieve_with_query_fusion(
+    retriever,
+    original_question,
+    rewritten_question
+):
+    """
+    Retrieve candidates using both the original and rewritten question,
+    then remove duplicate chunks.
+    """
+
+    original_docs = retriever.invoke(original_question)
+    rewritten_docs = retriever.invoke(rewritten_question)
+
+    unique_docs = {}
+
+    for doc in original_docs + rewritten_docs:
+        source_file = str(
+            doc.metadata.get("source_file", "")
+        ).strip()
+
+        page = str(
+            doc.metadata.get("page", "")
+        ).strip()
+
+        chunk_id = str(
+            doc.metadata.get("chunk_id", "")
+        ).strip()
+
+        key = (source_file, page, chunk_id)
+
+        if key not in unique_docs:
+            unique_docs[key] = doc
+
+    return list(unique_docs.values())
+
 def load_document(file_path, file_name):
 
     extension = file_name.lower().rsplit(".", 1)[-1]
@@ -255,8 +293,36 @@ def load_document(file_path, file_name):
             return loader.load()
 
     elif extension == "docx":
-        loader = Docx2txtLoader(file_path)
-        return loader.load()
+        docx_file = DocxDocument(file_path)
+
+        text_parts = []
+
+        for paragraph in docx_file.paragraphs:
+            if paragraph.text.strip():
+                text_parts.append(paragraph.text)
+
+        for table in docx_file.tables:
+            for row in table.rows:
+                row_text = " | ".join(
+                    cell.text.strip()
+                    for cell in row.cells
+                )
+                if row_text.strip():
+                    text_parts.append(row_text)
+
+        text = "\n".join(text_parts)
+
+        if not text.strip():
+            raise ValueError(
+                f"No text could be extracted from '{file_name}'."
+            )
+
+        return [
+            Document(
+                page_content=text,
+                metadata={}
+            )
+        ]
 
     elif extension in ["txt", "md"]:
         loader = TextLoader(
@@ -299,6 +365,234 @@ def save_document_registry(documents):
             indent=4
         )
 
+def get_knowledge_base_documents():
+    documents = []
+
+    if not os.path.exists(KNOWLEDGE_BASE_DIR):
+        return documents
+
+    documents_dir = os.path.join(
+        KNOWLEDGE_BASE_DIR,
+        "documents"
+    )
+
+    if not os.path.exists(documents_dir):
+        return documents
+
+    for department in os.listdir(documents_dir):
+        department_path = os.path.join(
+            documents_dir,
+            department
+        )
+
+        if not os.path.isdir(department_path):
+            continue
+
+        for file_name in os.listdir(department_path):
+            file_path = os.path.join(
+                department_path,
+                file_name
+            )
+
+            if file_name.lower().endswith(
+                (".pdf", ".docx", ".txt", ".md")
+            ):
+                documents.append(
+                    (file_path, file_name)
+                )
+
+    return documents
+
+def route_documents(
+    question,
+    document_router,
+    document_retrievers,
+    max_documents=3
+):
+    """
+    Select the most relevant source documents before
+    running chunk-level hybrid retrieval.
+    """
+
+    routed_docs = document_router.invoke(question)
+
+    selected_documents = []
+
+    for doc in routed_docs[:max_documents]:
+        source_file = doc.metadata.get("source_file")
+
+        if (
+            source_file
+            and source_file in document_retrievers
+            and source_file not in selected_documents
+        ):
+            selected_documents.append(source_file)
+
+    return selected_documents
+
+def load_existing_rag(document_paths=None):
+
+    if document_paths is None:
+        document_paths = get_knowledge_base_documents()
+
+    if not document_paths:
+        raise ValueError("No documents found in knowledge base.")
+
+    # Recreate chunks for BM25 only. No embeddings are generated here.
+    all_documents = []
+
+    for document_path, document_name in document_paths:
+        documents = load_document(
+            document_path,
+            document_name
+        )
+
+        for doc in documents:
+            doc.metadata["source_file"] = document_name
+
+        all_documents.extend(documents)
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,
+        chunk_overlap=75
+    )
+
+    docs = text_splitter.split_documents(all_documents)
+
+    for i, doc in enumerate(docs):
+        doc.metadata["chunk_id"] = i + 1
+
+        # Build a document-level BM25 router.
+        # One BM25 document represents one complete source document.
+    document_router_docs = []
+
+    for source_file in sorted(
+            set(doc.metadata["source_file"] for doc in docs)
+        ):
+            source_chunks = [
+                doc.page_content
+                for doc in docs
+                if doc.metadata["source_file"] == source_file
+            ]
+
+            document_router_docs.append(
+                Document(
+                    page_content="\n".join(source_chunks),
+                    metadata={
+                        "source_file": source_file
+                    }
+                )
+            )
+
+    document_router = BM25Retriever.from_documents(
+    document_router_docs
+        )
+
+    document_router.k = 3
+
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text",
+        dimensions=768,
+        keep_alive=600
+    )
+
+    # Load EXISTING persistent Chroma
+    vectorstore = Chroma(
+        embedding_function=embeddings,
+        persist_directory=os.path.join(
+            KNOWLEDGE_BASE_DIR,
+            "chroma_db"
+        ),
+        collection_name="enterprise_documents"
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 20}
+    )
+
+    bm25_retriever = BM25Retriever.from_documents(docs)
+    bm25_retriever.k = 20
+
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[retriever, bm25_retriever],
+        weights=[0.5, 0.5]
+    )
+
+    # Per-document hybrid retrievers
+    document_retrievers = {}
+
+    for source_file in set(
+        doc.metadata["source_file"] for doc in docs
+    ):
+        source_docs = [
+            doc for doc in docs
+            if doc.metadata["source_file"] == source_file
+        ]
+
+        source_bm25 = BM25Retriever.from_documents(source_docs)
+        source_bm25.k = 20
+
+        source_vector = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={
+                "k": 20,
+                "filter": {
+                    "source_file": source_file
+                }
+            }
+        )
+
+        document_retrievers[source_file] = EnsembleRetriever(
+            retrievers=[source_vector, source_bm25],
+            weights=[0.5, 0.5]
+        )
+
+    local_llm = ChatOllama(
+        model="gemma4:e4b",
+        max_tokens=512,
+        temperature=0.3
+    )
+
+    prompt_template = """
+    You are an Enterprise Knowledge Assistant.
+
+    Answer questions ONLY using the retrieved context.
+
+    Rules:
+    1. Never use outside knowledge.
+    2. Never hallucinate or guess.
+    3. If the answer is not found, say:
+    "I don't know based on the uploaded documents."
+    4. Prefer precise information over lengthy explanations.
+    5. Preserve names, numbers, dates, technical terms, and definitions.
+    6. Remove duplicate information.
+    7. Keep responses clear and professional.
+    8. Cite factual statements using [1], [2], [3], etc.
+    9. Each citation corresponds to [SOURCE N].
+    10. Never invent a citation number.
+    11. Place citations immediately after the statement they support.
+    12. If multiple sources support a statement, cite all relevant sources.
+
+    Retrieved Context:
+    {context}
+
+    Question:
+    {question}
+
+    Answer:
+    """
+
+    prompt = PromptTemplate.from_template(prompt_template)
+
+    return {
+        "retriever": hybrid_retriever,
+        "document_retrievers": document_retrievers,
+        "document_router": document_router,
+        "llm": local_llm,
+        "prompt": prompt
+    }
+
 def build_rag(document_paths): 
     
     # Load documents and split into chunks
@@ -314,10 +608,9 @@ def build_rag(document_paths):
                 document_name
             )
 
-        except Exception:
+        except Exception as e:
             raise ValueError(
-                f"Unable to process '{document_name}'. "
-                "The file may be corrupted or unsupported."
+                f"Unable to process '{document_name}': {e}"
             )
 
         if not documents:
@@ -373,7 +666,8 @@ def build_rag(document_paths):
         raise ValueError("No text could be extracted from this PDF.")
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
-        dimensions=768
+        dimensions=768,
+        keep_alive=600
     )
 
     print("First chunk:")
@@ -383,23 +677,39 @@ def build_rag(document_paths):
 
     print("Creating Chroma...")
 
+    # Create Chroma using small batches
+    batch_size = 16
+
+    first_batch = docs[:batch_size]
+
     vectorstore = Chroma.from_documents(
-        documents=docs,
+        documents=first_batch,
         embedding=embeddings,
         persist_directory=os.path.join(
-        KNOWLEDGE_BASE_DIR,
-        "chroma_db"
-    ),
+            KNOWLEDGE_BASE_DIR,
+            "chroma_db"
+        ),
         collection_name="enterprise_documents",
     )
+
+    for i in range(batch_size, len(docs), batch_size):
+        batch = docs[i:i + batch_size]
+
+        print(
+            f"Embedding chunks {i + 1} "
+            f"to {min(i + batch_size, len(docs))}..."
+        )
+
+        vectorstore.add_documents(batch)
+
     print("Chroma created successfully.")
 
     retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 10}
+        search_kwargs={"k": 20}
     )
     bm25_retriever = BM25Retriever.from_documents(docs)
-    bm25_retriever.k = 10
+    bm25_retriever.k = 20
     hybrid_retriever = EnsembleRetriever(
         retrievers=[retriever, bm25_retriever],
         weights=[0.5, 0.5]
@@ -414,7 +724,7 @@ def build_rag(document_paths):
         ]
 
         source_bm25 = BM25Retriever.from_documents(source_docs)
-        source_bm25.k = 6
+        source_bm25.k = 20
 
         source_vectorstore = Chroma.from_documents(
             documents=source_docs,
@@ -423,7 +733,7 @@ def build_rag(document_paths):
 
         source_vector = source_vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 6}
+            search_kwargs={"k": 20}
         )
 
         document_retrievers[source_file] = EnsembleRetriever(
