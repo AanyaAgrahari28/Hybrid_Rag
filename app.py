@@ -162,7 +162,7 @@ with st.sidebar:
 
         uploaded_files = st.file_uploader(
             "Upload documents",
-            type=["pdf", "docx", "txt", "md"],
+            type=["pdf", "docx", "txt", "md", "xml"],
             accept_multiple_files=True
         )
 
@@ -277,33 +277,27 @@ if "qa_chain" in st.session_state:
                     total_k=top_k
                 )
             else:
-                routed_documents = route_documents(
-                    rewritten_question,
-                    document_router,
-                    document_retrievers,
-                    max_documents=3
-                )
+                if selected_document == "All documents":
 
-                routed_retrievers = {
-                    source_file: document_retrievers[source_file]
-                    for source_file in routed_documents
-                }
+                    # Search the complete authorized document collection.
+                    docs = retriever.invoke(rewritten_question)
 
-                docs = []
+                else:
 
-                for source_file, document_retriever in routed_retrievers.items():
-                    docs.extend(
-                        document_retriever.invoke(rewritten_question)
+                    # For a specific document, restrict retrieval to that document.
+                    document_retriever = document_retrievers.get(
+                        selected_document
                     )
+
+                    if document_retriever is None:
+                        docs = []
+                    else:
+                        docs = document_retriever.invoke(
+                            rewritten_question
+                        )
 
                 initial_retrieved_count = len(docs)
-
-                if selected_document != "All documents":
-                    docs = filter_documents_by_metadata(
-                        docs,
-                        source_file=selected_document
-                    )
-
+                
                 reranked_docs = rerank_documents(
                     question,
                     docs,

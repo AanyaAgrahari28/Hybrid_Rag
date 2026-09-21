@@ -4,6 +4,7 @@ import langchain
 import uuid
 import os
 import json
+import xml.etree.ElementTree as ET
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -31,8 +32,8 @@ from langchain_community.document_loaders import (
     TextLoader,
 )
 
-from docx import Document as DocxDocument
 from langchain_core.documents import Document
+from unstructured.partition.docx import partition_docx
 
 KNOWLEDGE_BASE_DIR = "knowledge_base"
 DOCUMENT_REGISTRY = os.path.join(
@@ -280,60 +281,135 @@ def retrieve_with_query_fusion(
 
     return list(unique_docs.values())
 
-def load_document(file_path, file_name):
+def load_document(file_path, file_name=None):
+    """Load supported enterprise documents with page-aware metadata."""
 
-    extension = file_name.lower().rsplit(".", 1)[-1]
+    if file_name is None:
+        file_name = os.path.basename(file_path)
 
-    if extension == "pdf":
+    extension = os.path.splitext(file_path)[1].lower()
+
+    # -------------------------
+    # PDF
+    # -------------------------
+    if extension == ".pdf":
         try:
             loader = PyPDFLoader(file_path)
-            return loader.load()
+            documents = loader.load()
         except Exception:
             loader = PyMuPDFLoader(file_path)
-            return loader.load()
+            documents = loader.load()
 
-    elif extension == "docx":
-        docx_file = DocxDocument(file_path)
+        for doc in documents:
+            page = doc.metadata.get("page")
 
-        text_parts = []
+            if isinstance(page, int):
+                doc.metadata["page"] = page + 1
 
-        for paragraph in docx_file.paragraphs:
-            if paragraph.text.strip():
-                text_parts.append(paragraph.text)
+            doc.metadata["source_file"] = file_name
 
-        for table in docx_file.tables:
-            for row in table.rows:
-                row_text = " | ".join(
-                    cell.text.strip()
-                    for cell in row.cells
+        return documents
+
+    # -------------------------
+    # DOCX
+    # -------------------------
+    elif extension == ".docx":
+        elements = partition_docx(
+            filename=file_path,
+            include_page_breaks=True
+        )
+
+        documents = []
+        current_page = 1
+
+        for element in elements:
+
+            # Detect explicit page breaks
+            if getattr(element, "category", "") == "PageBreak":
+                current_page += 1
+                continue
+
+            text = str(element).strip()
+
+            if not text:
+                continue
+
+            # Use native page metadata if available
+            page_number = getattr(
+                element.metadata,
+                "page_number",
+                None
+            )
+
+            # Otherwise use our page-break counter
+            if page_number is None:
+                page_number = current_page
+
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "page": page_number,
+                        "source_file": file_name
+                    }
                 )
-                if row_text.strip():
-                    text_parts.append(row_text)
+            )
 
-        text = "\n".join(text_parts)
-
-        if not text.strip():
+        if not documents:
             raise ValueError(
                 f"No text could be extracted from '{file_name}'."
             )
 
-        return [
-            Document(
-                page_content=text,
-                metadata={}
-            )
-        ]
+        return documents
 
-    elif extension in ["txt", "md"]:
+    # -------------------------
+    # TXT / MD
+    # -------------------------
+    elif extension in [".txt", ".md"]:
         loader = TextLoader(
             file_path,
             encoding="utf-8"
         )
-        return loader.load()
+
+        documents = loader.load()
+
+        for doc in documents:
+            doc.metadata["page"] = None
+            doc.metadata["source_file"] = file_name
+
+        return documents
+
+    # -------------------------
+    # XML
+    # -------------------------
+    elif extension == ".xml":
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+
+        text_parts = []
+
+        for element in root.iter():
+            if element.text and element.text.strip():
+                text_parts.append(element.text.strip())
+
+        text = "\n".join(text_parts)
+
+        if not text.strip():
+            raise ValueError(f"No readable text found in XML file: {file_name}")
+
+        return [
+            Document(
+                page_content=text,
+                metadata={
+                    "page": None,
+                    "source_file": file_name,
+                },
+            )
+        ]
 
     else:
         raise ValueError(
-            f"Unsupported file type: .{extension}"
+            f"Unsupported file type: {extension}"
         )
 
 def load_document_registry():
@@ -395,7 +471,7 @@ def get_knowledge_base_documents():
             )
 
             if file_name.lower().endswith(
-                (".pdf", ".docx", ".txt", ".md")
+                (".pdf", ".docx", ".txt", ".md", ".xml")
             ):
                 documents.append(
                     (file_path, file_name)
@@ -437,6 +513,11 @@ def load_existing_rag(document_paths=None):
 
     if not document_paths:
         raise ValueError("No documents found in knowledge base.")
+
+    authorized_source_files = [
+        document_name
+        for _, document_name in document_paths
+        ]
 
     # Recreate chunks for BM25 only. No embeddings are generated here.
     all_documents = []
@@ -506,9 +587,45 @@ def load_existing_rag(document_paths=None):
         collection_name="enterprise_documents"
     )
 
+    # Rebuild persistent Chroma if the collection is empty
+    if vectorstore._collection.count() == 0:
+
+        batch_size = 8
+
+        first_batch = docs[:batch_size]
+
+        vectorstore = Chroma.from_documents(
+            documents=first_batch,
+            embedding=embeddings,
+            persist_directory=os.path.join(
+                KNOWLEDGE_BASE_DIR,
+                "chroma_db"
+            ),
+            collection_name="enterprise_documents"
+        )
+
+        for i in range(batch_size, len(docs), batch_size):
+            batch = docs[i:i + batch_size]
+
+            print(
+                f"Embedding chunks {i + 1} "
+                f"to {min(i + batch_size, len(docs))}..."
+            )
+
+            vectorstore.add_documents(batch)
+
+        print("Persistent Chroma index created successfully.")
+
     retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 20}
+        search_kwargs={
+            "k": 20,
+            "filter": {
+                "source_file": {
+                    "$in": authorized_source_files
+                }
+            }
+        }
     )
 
     bm25_retriever = BM25Retriever.from_documents(docs)
@@ -659,6 +776,28 @@ def build_rag(document_paths):
     for i, doc in enumerate(docs):
         doc.metadata["chunk_id"] = i + 1
 
+    # Build document-level BM25 router
+    document_router_docs = []
+    for source_file in sorted(
+        set(doc.metadata["source_file"] for doc in docs)
+    ):
+        source_chunks = [
+            doc.page_content
+            for doc in docs
+            if doc.metadata["source_file"] == source_file
+        ]
+        document_router_docs.append(
+            Document(
+                page_content="\n".join(source_chunks),
+                metadata={
+                    "source_file": source_file
+                }
+            )
+        )
+    document_router = BM25Retriever.from_documents(
+        document_router_docs
+    )
+    document_router.k = 3
     print("Documents:", len(all_documents))
     print("Chunks:", len(docs))
 
@@ -812,6 +951,7 @@ def build_rag(document_paths):
     return {
     "retriever": hybrid_retriever,
     "document_retrievers": document_retrievers,
+    "document_router": document_router,
     "llm": local_llm,
     "prompt": prompt,
 }
