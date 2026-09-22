@@ -78,7 +78,7 @@ def balanced_multi_document_retrieval(
 ):
     all_docs = []
 
-    # Retrieve from each document separately
+    # Retrieve candidates from every authorized document
     for document_retriever in document_retrievers.values():
         all_docs.extend(
             document_retriever.invoke(question)
@@ -103,6 +103,9 @@ def balanced_multi_document_retrieval(
 
     docs = list(unique_docs.values())
 
+    if not docs:
+        return []
+
     # Rerank all unique candidates
     ranked_docs = rerank_documents(
         question,
@@ -110,53 +113,10 @@ def balanced_multi_document_retrieval(
         top_k=len(docs)
     )
 
-    # Select at least one unique chunk from each document
-    selected_docs = []
-    selected_keys = set()
-
-    for source_file in document_retrievers:
-
-        for doc in ranked_docs:
-
-            doc_source = str(
-                doc.metadata.get("source_file", "")
-            ).strip()
-
-            chunk_id = str(
-                doc.metadata.get("chunk_id", "")
-            ).strip()
-
-            key = (doc_source, chunk_id)
-
-            if (
-                doc_source == source_file
-                and key not in selected_keys
-            ):
-                selected_docs.append(doc)
-                selected_keys.add(key)
-                break
-
-    # Fill remaining slots with highest-ranked UNIQUE chunks
-    for doc in ranked_docs:
-
-        if len(selected_docs) >= total_k:
-            break
-
-        doc_source = str(
-            doc.metadata.get("source_file", "")
-        ).strip()
-
-        chunk_id = str(
-            doc.metadata.get("chunk_id", "")
-        ).strip()
-
-        key = (doc_source, chunk_id)
-
-        if key not in selected_keys:
-            selected_docs.append(doc)
-            selected_keys.add(key)
-
-    return selected_docs[:total_k]
+    # Select only the highest-ranked chunks globally.
+    # This allows multiple relevant chunks from the same document
+    # when they are more relevant than chunks from other documents.
+    return ranked_docs[:total_k]
 
 def filter_documents_by_metadata(documents, source_file=None, page_number=None):
     """
@@ -311,45 +271,26 @@ def load_document(file_path, file_name=None):
         return documents
 
     # -------------------------
-    # DOCX
+    # PDF
     # -------------------------
     elif extension == ".docx":
         elements = partition_docx(
-            filename=file_path,
-            include_page_breaks=True
+            filename=file_path
         )
 
         documents = []
-        current_page = 1
 
         for element in elements:
-
-            # Detect explicit page breaks
-            if getattr(element, "category", "") == "PageBreak":
-                current_page += 1
-                continue
 
             text = str(element).strip()
 
             if not text:
                 continue
 
-            # Use native page metadata if available
-            page_number = getattr(
-                element.metadata,
-                "page_number",
-                None
-            )
-
-            # Otherwise use our page-break counter
-            if page_number is None:
-                page_number = current_page
-
             documents.append(
                 Document(
                     page_content=text,
                     metadata={
-                        "page": page_number,
                         "source_file": file_name
                     }
                 )
@@ -374,7 +315,6 @@ def load_document(file_path, file_name=None):
         documents = loader.load()
 
         for doc in documents:
-            doc.metadata["page"] = None
             doc.metadata["source_file"] = file_name
 
         return documents
@@ -401,7 +341,6 @@ def load_document(file_path, file_name=None):
             Document(
                 page_content=text,
                 metadata={
-                    "page": None,
                     "source_file": file_name,
                 },
             )
@@ -411,6 +350,7 @@ def load_document(file_path, file_name=None):
         raise ValueError(
             f"Unsupported file type: {extension}"
         )
+
 
 def load_document_registry():
 
@@ -666,7 +606,7 @@ def load_existing_rag(document_paths=None):
         )
 
     local_llm = ChatOllama(
-        model="gemma4:e4b",
+        model="nemotron-mini:4b-instruct-q4_K_M",
         max_tokens=512,
         temperature=0.3
     )
@@ -814,24 +754,21 @@ def build_rag(document_paths):
 
     collection_name = f"pdf_{uuid.uuid4().hex}"
 
-    print("Creating Chroma...")
+    print("Adding documents to persistent Chroma...")
 
-    # Create Chroma using small batches
-    batch_size = 16
-
-    first_batch = docs[:batch_size]
-
-    vectorstore = Chroma.from_documents(
-        documents=first_batch,
-        embedding=embeddings,
+    vectorstore = Chroma(
+        embedding_function=embeddings,
         persist_directory=os.path.join(
             KNOWLEDGE_BASE_DIR,
             "chroma_db"
         ),
-        collection_name="enterprise_documents",
+        collection_name="enterprise_documents"
     )
 
-    for i in range(batch_size, len(docs), batch_size):
+    batch_size = 8
+
+    for i in range(0, len(docs), batch_size):
+
         batch = docs[i:i + batch_size]
 
         print(
@@ -841,7 +778,7 @@ def build_rag(document_paths):
 
         vectorstore.add_documents(batch)
 
-    print("Chroma created successfully.")
+    print("Documents added to persistent Chroma successfully.")
 
     retriever = vectorstore.as_retriever(
         search_type="similarity",

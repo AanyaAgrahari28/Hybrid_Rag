@@ -160,19 +160,42 @@ with st.sidebar:
 
         st.markdown("### ⬆️ Upload Documents")
 
+        upload_department = st.selectbox(
+            "Department",
+            [
+                "Customer_Support",
+                "Engineering_IT",
+                "Finance",
+                "Information_Security",
+                "Legal_Compliance",
+                "Operations",
+                "People_HR"
+            ]
+        )
+
         uploaded_files = st.file_uploader(
             "Upload documents",
             type=["pdf", "docx", "txt", "md", "xml"],
             accept_multiple_files=True
         )
 
+
     else:
         uploaded_files = []
         uploaded_names = []
 
     all_document_names = [
-    name for _, name in authorized_documents
-]
+        name for _, name in authorized_documents
+    ]
+
+    # Include documents uploaded in the current Admin session
+    if role == "Admin" and uploaded_files:
+        all_document_names = list(
+            dict.fromkeys(
+                all_document_names
+                + [file.name for file in uploaded_files]
+            )
+        )
 
     selected_document = st.selectbox(
         "Filter by document",
@@ -206,20 +229,33 @@ if "qa_chain" in st.session_state:
 
         document_paths = []
 
+        department_path = os.path.join(
+            "knowledge_base",
+            "documents",
+            upload_department
+        )
+
+        os.makedirs(
+            department_path,
+            exist_ok=True
+        )
+
         for uploaded_file in uploaded_files:
 
-            extension = uploaded_file.name.rsplit(".", 1)[-1]
+            permanent_path = os.path.join(
+                department_path,
+                uploaded_file.name
+            )
 
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=f".{extension}"
-            ) as tmp:
+            with open(permanent_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-                tmp.write(uploaded_file.read())
-
-                document_paths.append(
-                    (tmp.name, uploaded_file.name)
+            document_paths.append(
+                (
+                    permanent_path,
+                    uploaded_file.name
                 )
+            )
 
         uploaded_names = [
             name for _, name in document_paths
@@ -232,16 +268,27 @@ if "qa_chain" in st.session_state:
         ):
 
             with st.spinner("Processing documents..."):
+
                 try:
-                    st.session_state.qa_chain = build_rag(document_paths)
+                    st.session_state.qa_chain = load_existing_rag(
+                        get_authorized_documents(
+                            get_knowledge_base_documents(),
+                            allowed_departments
+                        )
+                    )
 
                 except Exception as e:
                     st.error(str(e))
                     st.stop()
+
             st.session_state.current_pdf = uploaded_names
             st.session_state.chat_history = []
 
-            st.success(f"{len(uploaded_files)} documents processed successfully.")
+            st.success(
+                f"{len(uploaded_files)} documents processed successfully."
+            )
+
+            st.rerun()
 
     question = st.chat_input("Ask a question...")
 
@@ -259,7 +306,11 @@ if "qa_chain" in st.session_state:
             llm = rag["llm"]
             prompt = rag["prompt"]
 
+            # Measure query rewriting
+            rewrite_start = time.time()
             rewritten_question = rewrite_query(question, llm)
+            rewrite_time = time.time() - rewrite_start
+
             initial_retrieved_count = 0
 
             is_multi_document = (
@@ -297,7 +348,7 @@ if "qa_chain" in st.session_state:
                         )
 
                 initial_retrieved_count = len(docs)
-                
+
                 reranked_docs = rerank_documents(
                     question,
                     docs,
@@ -373,7 +424,12 @@ if "qa_chain" in st.session_state:
                 question=question
             )
 
+            answer_start = time.time()
             result = llm.invoke(formatted_prompt)
+            answer_time = time.time() - answer_start
+            answer_text = result.content
+            answer_length = len(answer_text)
+            total_time = rewrite_time + retrieval_time + answer_time
 
             st.write("### 🔍 Retrieval Diagnostics")
 
@@ -381,14 +437,18 @@ if "qa_chain" in st.session_state:
             st.write(f"**Final chunks used:** {len(reranked_docs)}")
 
         st.session_state.chat_history.append(
-            {
-                "question": question,
-                "answer": result.content,
-                "sources": sources,
-                "retrieval_time": retrieval_time,
-                "final_chunks": len(reranked_docs)
-            }
-        )
+    {
+        "question": question,
+        "answer": result.content,
+        "sources": sources,
+        "retrieval_time": retrieval_time,
+        "rewrite_time": rewrite_time,
+        "answer_time": answer_time,
+        "total_time": total_time,
+        "answer_length": answer_length,
+        "final_chunks": len(reranked_docs)
+    }
+)
 
         st.rerun()
 
@@ -421,8 +481,14 @@ if "qa_chain" in st.session_state:
                         f"**Final chunks used:** "
                         f"{chat['final_chunks']}"
                     )
-
-                    st.write("### 📄 Sources")
+                    st.write(f"**Query rewrite:** {chat['rewrite_time']:.2f} seconds")
+                    st.write(f"**Retrieval + reranking:** {chat['retrieval_time']:.2f} seconds")
+                    st.write(f"**Answer generation:** {chat['answer_time']:.2f} seconds")
+                    st.write(f"**Total latency:** {chat['total_time']:.2f} seconds")
+                    st.write(
+                        f"**Answer length:** {chat['answer_length']} characters"
+                    )
+                    st.write("# 📄 Sources")
 
                     grouped_sources = defaultdict(list)
 
@@ -434,12 +500,27 @@ if "qa_chain" in st.session_state:
                         st.markdown(f"**📄 {source_file}**")
 
                         for item in items:
+                            file_extension = os.path.splitext(
+                                source_file
+                            )[1].lower()
+
+                            if file_extension == ".pdf":
+                                source_details = (
+                                    f"Page {item['page']} · "
+                                    f"Chunk {item['chunk_id']} · "
+                                    f"Rerank score: "
+                                    f"{item['score']:.2f}"
+                                )
+                            else:
+                                source_details = (
+                                    f"Chunk {item['chunk_id']} · "
+                                    f"Rerank score: "
+                                    f"{item['score']:.2f}"
+                                )
+
                             st.write(
                                 f"**[{item['citation_id']}]** "
-                                f"Page {item['page']} · "
-                                f"Chunk {item['chunk_id']} · "
-                                f"Rerank score: "
-                                f"{item['score']:.2f}"
+                                f"{source_details}"
                             )
 
             st.divider()
